@@ -790,7 +790,9 @@ def main():
     if not os.path.exists(args.output_dir):
         raise ValueError(f"Output path {args.output_dir} does not exist")
 
-    logger.info("Will generate type stubs for %s in %s", args.module_name, output_path)
+    logger.info(
+        "Will generate type stubs for %s in %s", args.module_name, args.output_dir
+    )
 
     with ChdirGuard(args.output_dir):
         module = ModuleStubsGenerator(args.module_name)
