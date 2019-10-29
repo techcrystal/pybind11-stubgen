@@ -1,21 +1,31 @@
-from typing import Optional, Callable, Iterator, Iterable, List, Set, Mapping, Tuple, Any
-from functools import cmp_to_key
+from argparse import ArgumentParser
 import importlib
-import itertools
 import inspect
+import itertools
 import logging
-import sys
 import os
 import re
-from argparse import ArgumentParser
+import sys
+from functools import total_ordering
 
+stderr_handler = logging.StreamHandler(sys.stderr)
+handlers = [stderr_handler]
+
+logging.basicConfig(
+    level=logging.getLevelName(logging.INFO),
+    format="[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s",
+    handlers=handlers,
+)
 logger = logging.getLogger(__name__)
 
+SCUBADATA_FBCODE_DIR = "rfe/scubadata"
+SCUBADATA_MODULE_NAME = "rfe.scubadata.scubadata_py3"
 
-class DirectoryWalkerGuard(object):
 
+class ChdirGuard:
     def __init__(self, dirname):
         self.dirname = dirname
+        self.cur_dir = os.getcwd()
 
     def __enter__(self):
         if not os.path.exists(self.dirname):
@@ -26,19 +36,21 @@ class DirectoryWalkerGuard(object):
         os.chdir(self.dirname)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        os.chdir(os.path.pardir)
+        os.chdir(self.cur_dir)
 
 
 class FunctionSignature(object):
-
-    def __init__(self, name, args='*args, **kwargs', rtype='None'):
+    def __init__(self, name, args="*args, **kwargs", rtype="None"):
         self.name = name
         self.args = args
         self.rtype = rtype
 
     def __eq__(self, other):
-        return isinstance(other, FunctionSignature) and (self.name, self.args, self.rtype) == (
-            other.name, other.args, other.rtype)
+        return isinstance(other, FunctionSignature) and (
+            self.name,
+            self.args,
+            self.rtype,
+        ) == (other.name, other.args, other.rtype)
 
     def __hash__(self):
         return hash((self.name, self.args, self.rtype))
@@ -67,14 +79,22 @@ class FunctionSignature(object):
 
     @staticmethod
     def argument_type(arg):
+        if "=" in arg:
+            arg = arg.split("=")[0]
         return arg.split(":")[-1].strip()
 
     def get_all_involved_types(self):
         types = []
         for t in [self.rtype] + self.split_arguments():
-            types.extend([m[0] for m in
-                          re.findall(r"([a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*)", self.argument_type(t))
-                          ])
+            types.extend(
+                [
+                    m[0]
+                    for m in re.findall(
+                        r"([a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*)",
+                        self.argument_type(t),
+                    )
+                ]
+            )
         return types
 
 
@@ -91,12 +111,15 @@ class PropertySignature(object):
 
     @property
     def setter_arg_type(self):
-        return FunctionSignature.argument_type(FunctionSignature('name', self.setter_args).split_arguments()[1])
+        return FunctionSignature.argument_type(
+            FunctionSignature("name", self.setter_args).split_arguments()[1]
+        )
 
 
 def replace_numpy_array(match_obj):
-    result = r"numpy.ndarray[{type}, _Shape[{shape}]]".format(type=match_obj.group("type"),
-                                                              shape=match_obj.group("shape"))
+    result = r"numpy.ndarray[{type}, _Shape[{shape}]]".format(
+        type=match_obj.group("type"), shape=match_obj.group("shape")
+    )
     return result
 
 
@@ -104,7 +127,10 @@ class StubsGenerator(object):
     INDENT = " " * 4
 
     GLOBAL_CLASSNAME_REPLACEMENTS = {
-        re.compile(r"numpy.ndarray\[(?P<type>[^\[\]]+)(\[(?P<shape>[^\[\]]+)\])\]"): replace_numpy_array
+        re.compile(
+            r"numpy.ndarray\[(?P<type>[^\[\]]+)(\[(?P<shape>[^\[\]]+)\])\]"
+        ): replace_numpy_array,
+        re.compile(r"facebook::rfe::ScubaData::Sample"): lambda _: "Sample",
     }
 
     def parse(self):
@@ -125,9 +151,7 @@ class StubsGenerator(object):
         if module_name == "builtins":
             return class_name
         else:
-            return "{module}.{klass}".format(
-                module=module_name,
-                klass=class_name)
+            return "{module}.{klass}".format(module=module_name, klass=class_name)
 
     @staticmethod
     def apply_classname_replacements(s):  # type: (str) -> Any
@@ -136,17 +160,28 @@ class StubsGenerator(object):
         return s
 
     @staticmethod
-    def function_signatures_from_docstring(name, func, module_name):  # type: (Any, str) -> List[FunctionSignature]
+    def function_signatures_from_docstring(
+        name, func, module_name
+    ):  # type: (Any, str) -> List[FunctionSignature]
         try:
             no_parentheses = r"[^()]*"
-            parentheses_one_fold = r"({nopar}(\({nopar}\))?)*".format(nopar=no_parentheses)
-            parentheses_two_fold = r"({nopar}(\({par1}\))?)*".format(par1=parentheses_one_fold, nopar=no_parentheses)
-            parentheses_three_fold = r"({nopar}(\({par2}\))?)*".format(par2=parentheses_two_fold, nopar=no_parentheses)
-            signature_regex = r"(\s*(?P<overload_number>\d+).)" \
-                              r"?\s*{name}\s*\((?P<args>{balanced_parentheses})\)" \
-                              r"\s*->\s*" \
-                              r"(?P<rtype>[^\(\)]+)\s*".format(name=name,
-                                                               balanced_parentheses=parentheses_three_fold)
+            parentheses_one_fold = r"({nopar}(\({nopar}\))?)*".format(
+                nopar=no_parentheses
+            )
+            parentheses_two_fold = r"({nopar}(\({par1}\))?)*".format(
+                par1=parentheses_one_fold, nopar=no_parentheses
+            )
+            parentheses_three_fold = r"({nopar}(\({par2}\))?)*".format(
+                par2=parentheses_two_fold, nopar=no_parentheses
+            )
+            signature_regex = (
+                r"(\s*(?P<overload_number>\d+).)"
+                r"?\s*{name}\s*\((?P<args>{balanced_parentheses})\)"
+                r"\s*->\s*"
+                r"(?P<rtype>[^\(\)]+)\s*".format(
+                    name=name, balanced_parentheses=parentheses_three_fold
+                )
+            )
             doc_lines = func.__doc__
             signatures = []
             for line in doc_lines.split("\n"):
@@ -172,7 +207,9 @@ class StubsGenerator(object):
             return []
 
     @staticmethod
-    def property_signature_from_docstring(prop, module_name):  # type:  (Any, str)-> PropertySignature
+    def property_signature_from_docstring(
+        prop, module_name
+    ):  # type:  (Any, str)-> PropertySignature
 
         getter_rtype = "None"
         setter_args = "None"
@@ -186,7 +223,9 @@ class StubsGenerator(object):
                 for line in prop.fget.__doc__.split("\n"):
                     if strip_module_name:
                         line = line.replace(module_name + ".", "")
-                    m = re.match(r"\s*\((?P<args>[^()]*)\)\s*->\s*(?P<rtype>[^()]+)\s*", line)
+                    m = re.match(
+                        r"\s*\((?P<args>[^()]*)\)\s*->\s*(?P<rtype>[^()]+)\s*", line
+                    )
                     if m:
                         getter_rtype = m.group("rtype")
                         break
@@ -197,7 +236,9 @@ class StubsGenerator(object):
                 for line in prop.fset.__doc__.split("\n"):
                     if strip_module_name:
                         line = line.replace(module_name + ".", "")
-                    m = re.match(r"\s*\((?P<args>[^()]*)\)\s*->\s*(?P<rtype>[^()]+)\s*", line)
+                    m = re.match(
+                        r"\s*\((?P<args>[^()]*)\)\s*->\s*(?P<rtype>[^()]+)\s*", line
+                    )
                     if m:
                         args = m.group("args")
                         # replace first argument with self
@@ -213,19 +254,30 @@ class StubsGenerator(object):
         if docstring is None:
             return ""
 
-        signature_regex = r"(\s*(?P<overload_number>\d+).\s*)" \
-                          r"?{name}\s*\((?P<args>[^\(\)]*)\)\s*(->\s*(?P<rtype>[^\(\)]+)\s*)?".format(name=r"\w+")
+        signature_regex = (
+            r"(\s*(?P<overload_number>\d+).\s*)"
+            r"?{name}\s*\((?P<args>[^\(\)]*)\)\s*(->\s*(?P<rtype>[^\(\)]+)\s*)?".format(
+                name=r"\w+"
+            )
+        )
 
         lines = docstring.split("\n")
         lines = filter(lambda line: line != "Overloaded function.", lines)
 
-        return "\n".join(filter(lambda line: not re.match(signature_regex, line), lines))
+        return "\n".join(
+            [
+                line
+                for line in lines
+                if not re.match(signature_regex, line) and line.strip()
+            ]
+        )
 
 
 class AttributeStubsGenerator(StubsGenerator):
-    def __init__(self, name, attribute):  # type: (str, Any)-> None
+    def __init__(self, name, attribute, is_enum=False):  # type: (str, Any, bool)-> None
         self.name = name
         self.attr = attribute
+        self.is_enum = is_enum
 
     def parse(self):
         pass
@@ -235,7 +287,7 @@ class AttributeStubsGenerator(StubsGenerator):
             return True
         if isinstance(value, (float, complex)):
             try:
-                eval(repr(value))
+                eval(repr(value))  # noqa: P204
                 return True
             except (SyntaxError, NameError):
                 return False
@@ -252,35 +304,39 @@ class AttributeStubsGenerator(StubsGenerator):
         return False
 
     def to_lines(self):  # type: () -> List[str]
-        if self.is_safe_to_use_repr(self.attr):
+        if self.is_enum:
             return [
-                "{name} = {repr}".format(
-                    name=self.name,
-                    repr=repr(self.attr)
+                '{name}: "{type}"'.format(
+                    name=self.name, type=self.attr.__class__.__name__
                 )
             ]
+        if self.is_safe_to_use_repr(self.attr):
+            return ["{name} = {repr}".format(name=self.name, repr=repr(self.attr))]
 
         value_lines = repr(self.attr).split("\n")
         if len(value_lines) == 1:
             value = value_lines[0]
             return [
-                "{name} = None # type: {typename} # value = {value}".format(
+                "{name} = ... # type: {typename} # value = {value}".format(
                     name=self.name,
                     typename=self.fully_qualified_name(type(self.attr)),
-                    value=value)
+                    value=value,
+                )
             ]
         else:
-            return [
-                       "{name} = None # type: {typename} # value = ".format(
-                           name=self.name,
-                           typename=str(type(self.attr)))
-                   ] \
-                   + ['"""'] \
-                   + [l.replace('"""', r'\"\"\"') for l in value_lines] \
-                   + ['"""']
+            return (
+                [
+                    "{name} = ... # type: {typename} # value = ".format(
+                        name=self.name, typename=str(type(self.attr))
+                    )
+                ]
+                + ['"""']
+                + [l.replace('"""', r"\"\"\"") for l in value_lines]
+                + ['"""']
+            )
 
     def get_involved_modules_names(self):  # type: () -> Set[str]
-        return set((self.attr.__class__.__module__,) )
+        return {self.attr.__class__.__module__}
 
 
 class FreeFunctionStubsGenerator(StubsGenerator):
@@ -291,7 +347,9 @@ class FreeFunctionStubsGenerator(StubsGenerator):
         self.signatures = []  # type:  List[FunctionSignature]
 
     def parse(self):
-        self.signatures = self.function_signatures_from_docstring(self.name, self.member, self.module_name)
+        self.signatures = self.function_signatures_from_docstring(
+            self.name, self.member, self.module_name
+        )
 
     def to_lines(self):  # type: () -> List[str]
         result = []
@@ -299,18 +357,21 @@ class FreeFunctionStubsGenerator(StubsGenerator):
         for sig in self.signatures:
             if len(self.signatures) > 1:
                 result.append("@overload")
-            result.append("def {name}({args}) -> {rtype}:".format(
-                name=sig.name,
-                args=sig.args,
-                rtype=sig.rtype
-            ))
+            result.append(
+                "def {name}({args}) -> {rtype}:".format(
+                    name=sig.name, args=sig.args, rtype=sig.rtype
+                )
+            )
             if docstring:
                 # don't print space-only docstrings
                 if re.match(r"^\s$", docstring, re.MULTILINE):
                     result.append(self.INDENT + "pass")
                     # warn about empty docstrings for all functions except __???__
                     if not (sig.name.startswith("__") and sig.name.endswith("__")):
-                        logger.debug("Docstring is empty for '%s'" % self.fully_qualified_name(self.member))
+                        logger.debug(
+                            "Docstring is empty for '%s'"
+                            % self.fully_qualified_name(self.member)
+                        )
                 else:
                     result.append(self.INDENT + '"""{}"""'.format(docstring))
                 docstring = None  # don't print docstring for other overloads
@@ -333,7 +394,9 @@ class FreeFunctionStubsGenerator(StubsGenerator):
 
 class ClassMemberStubsGenerator(FreeFunctionStubsGenerator):
     def __init__(self, name, free_function, module_name):
-        super(ClassMemberStubsGenerator, self).__init__(name, free_function, module_name)
+        super(ClassMemberStubsGenerator, self).__init__(
+            name, free_function, module_name
+        )
 
     def to_lines(self):  # type: () -> List[str]
         result = []
@@ -348,19 +411,24 @@ class ClassMemberStubsGenerator(FreeFunctionStubsGenerator):
             if len(self.signatures) > 1:
                 result.append("@overload")
 
-            result.append("def {name}({args}) -> {rtype}: {ellipsis}".format(
-                name=sig.name,
-                args=args,
-                rtype=sig.rtype,
-                ellipsis="" if docstring else "..."
-            ))
+            result.append(
+                "def {name}({args}) -> {rtype}: {ellipsis}".format(
+                    name=sig.name,
+                    args=args,
+                    rtype=sig.rtype,
+                    ellipsis="" if docstring else "...",
+                )
+            )
             if docstring:
                 # don't print space-only docstrings
                 if re.match(r"^\s$", docstring):
                     result.append(self.INDENT + "pass")
                     # warn about empty docstrings for all functions except __???__
                     if not (sig.name.startswith("__") and sig.name.endswith("__")):
-                        logger.debug("Docstring is empty for '%s'" % self.fully_qualified_name(self.member))
+                        logger.debug(
+                            "Docstring is empty for '%s'"
+                            % self.fully_qualified_name(self.member)
+                        )
                 else:
                     result.append(self.INDENT + '"""{}"""'.format(docstring))
                 docstring = None  # don't print docstring for other overloads
@@ -375,21 +443,30 @@ class PropertyStubsGenerator(StubsGenerator):
         self.signature = None  # type: PropertySignature
 
     def parse(self):
-        self.signature = self.property_signature_from_docstring(self.prop, self.module_name)
+        self.signature = self.property_signature_from_docstring(
+            self.prop, self.module_name
+        )
 
     def to_lines(self):  # type: () -> List[str]
 
         docstring = self.remove_signatures(self.prop.__doc__)
         docstring += "\n:type: {rtype}".format(rtype=self.signature.rtype)
 
-        result = ["@property",
-                  "def {field_name}(self) -> {rtype}:".format(field_name=self.name, rtype=self.signature.rtype),
-                  self.indent('"""{}"""'.format(docstring))]
+        result = [
+            "@property",
+            "def {field_name}(self) -> {rtype}:".format(
+                field_name=self.name, rtype=self.signature.rtype
+            ),
+            self.indent('"""{}"""'.format(docstring)),
+        ]
 
         if self.signature.setter_args != "None":
             result.append("@{field_name}.setter".format(field_name=self.name))
             result.append(
-                "def {field_name}({args}) -> None:".format(field_name=self.name, args=self.signature.setter_args))
+                "def {field_name}({args}) -> None:".format(
+                    field_name=self.name, args=self.signature.setter_args
+                )
+            )
             docstring = self.remove_signatures(self.prop.__doc__)
             if docstring:
                 result.append(self.indent('"""{}"""'.format(docstring)))
@@ -399,22 +476,27 @@ class PropertyStubsGenerator(StubsGenerator):
         return result
 
 
+@total_ordering
 class ClassStubsGenerator(StubsGenerator):
+    INNER_CLASSES_BLACKLIST = ("__class__", "__base__")
     ATTRIBUTES_BLACKLIST = ("__class__", "__module__", "__qualname__")
-    METHODS_BLACKLIST = ("__dir__", "__sizeof__")
+    METHODS_BLACKLIST = ("__dir__", "__sizeof__", "__eq__", "__ne__")
     BASE_CLASS_BLACKLIST = ("pybind11_object", "object")
 
-    def __init__(self,
-                 klass,
-                 attributes_blacklist=ATTRIBUTES_BLACKLIST,
-                 base_class_blacklist=BASE_CLASS_BLACKLIST,
-                 methods_blacklist=METHODS_BLACKLIST
-                 ):
+    def __init__(
+        self,
+        klass,
+        inner_classes_blacklist=INNER_CLASSES_BLACKLIST,
+        attributes_blacklist=ATTRIBUTES_BLACKLIST,
+        base_class_blacklist=BASE_CLASS_BLACKLIST,
+        methods_blacklist=METHODS_BLACKLIST,
+    ):
         self.klass = klass
         assert inspect.isclass(klass)
 
         self.doc_string = None  # type: Optional[str]
 
+        self.inner_classes = []  # type: List[ClassStubsGenerator]
         self.fields = []  # type: List[AttributeStubsGenerator]
         self.properties = []  # type: List[PropertyStubsGenerator]
         self.methods = []  # type: List[ClassMemberStubsGenerator]
@@ -422,6 +504,7 @@ class ClassStubsGenerator(StubsGenerator):
         self.base_classes = []
         self.involved_modules_names = set()  # Set[str]
 
+        self.inner_classes_blacklist = inner_classes_blacklist
         self.attributes_blacklist = attributes_blacklist
         self.base_class_blacklist = base_class_blacklist
         self.methods_blacklist = methods_blacklist
@@ -429,50 +512,100 @@ class ClassStubsGenerator(StubsGenerator):
     def get_involved_modules_names(self):
         return self.involved_modules_names
 
-    def parse(self):
-        for name, member in inspect.getmembers(self.klass):
-            if inspect.isroutine(member):
-                self.methods.append(ClassMemberStubsGenerator(name, member, self.klass.__module__))
-            elif isinstance(member, property):
-                self.properties.append(PropertyStubsGenerator(name, member, self.klass.__module__))
-            elif name == "__doc__":
-                self.doc_string = member
-            elif name not in self.attributes_blacklist:
-                self.fields.append(AttributeStubsGenerator(name, member))
-                # logger.warning("Unknown member %s type : `%s` " % (name, str(type(member))))
+    def _init_members(self):
+        members = dict(inspect.getmembers(self.klass))
+        if "__members__" in members:
+            # Hack to make Enums work
+            self.fields = [
+                AttributeStubsGenerator(name, value, is_enum=True)
+                for name, value in members["__members__"].items()
+            ]
+            self.fields.append(
+                AttributeStubsGenerator("__members__", members["__members__"])
+            )
+            self.doc_string = members.get("__doc__", None)
+        else:
+            for name, member in members.items():
+                if inspect.isroutine(member):
+                    self.methods.append(
+                        ClassMemberStubsGenerator(name, member, self.klass.__module__)
+                    )
+                elif (
+                    inspect.isclass(member) and name not in self.inner_classes_blacklist
+                ):
+                    self.inner_classes.append(ClassStubsGenerator(member))
+                elif isinstance(member, property):
+                    self.properties.append(
+                        PropertyStubsGenerator(name, member, self.klass.__module__)
+                    )
+                elif name == "__doc__":
+                    self.doc_string = member
+                elif name not in self.attributes_blacklist:
+                    self.fields.append(AttributeStubsGenerator(name, member))
 
-        for x in itertools.chain(self.methods,
-                                 self.properties,
-                                 self.fields):
+        self.inner_classes.sort(reverse=True)  # Always write base classes first
+
+    def parse(self):
+        self._init_members()
+        for x in itertools.chain(
+            self.inner_classes, self.methods, self.properties, self.fields
+        ):
             x.parse()
 
         bases = inspect.getmro(self.klass)[1:]
 
         for B in bases:
-            if B.__name__ != self.klass.__name__ and B.__name__ not in self.base_class_blacklist:
+            if (
+                B.__name__ != self.klass.__name__
+                and B.__name__ not in self.base_class_blacklist
+            ):
                 self.base_classes.append(B)
                 self.involved_modules_names.add(B.__module__)
 
         for f in self.methods:  # type: ClassMemberStubsGenerator
             self.involved_modules_names |= f.get_involved_modules_names()
 
-    def to_lines(self):  # type: () -> List[str]
+        for c in self.inner_classes:
+            self.involved_modules_names |= c.get_involved_modules_names()
 
+    def __eq__(self, other):  # type: (object) -> bool
+        if not isinstance(other, ClassStubsGenerator):
+            return False
+        return self.klass is other.klass
+
+    def __lt__(self, other):  # type: (object) -> bool
+        if not isinstance(other, ClassStubsGenerator):
+            raise TypeError(
+                "Comparision not supported between instances of "
+                f"'{type(self)}' and '{type(other)}"
+            )
+        return issubclass(self.klass, other.klass)
+
+    def to_lines(self):  # type: () -> List[str]
         def strip_current_module_name(obj, module_name):
             regex = r"{}\.(\w+)".format(module_name.replace(".", r"\."))
             return re.sub(regex, r"\g<1>", obj)
 
         base_classes_list = [
-            strip_current_module_name(self.fully_qualified_name(b), self.klass.__module__)
+            strip_current_module_name(
+                self.fully_qualified_name(b), self.klass.__module__
+            )
             for b in self.base_classes
         ]
         result = [
-            "class {class_name}({base_classes_list}):{doc_string}".format(
+            "class {class_name}{base_classes_list}:{doc_string}".format(
                 class_name=self.klass.__name__,
-                base_classes_list=", ".join(base_classes_list),
-                doc_string='\n' + self.INDENT + '"""{}"""'.format(self.doc_string) if self.doc_string else "",
-            ),
+                base_classes_list=f"({', '.join(base_classes_list)})"
+                if base_classes_list
+                else "",
+                doc_string="\n" + self.INDENT + '"""{}"""'.format(self.doc_string)
+                if self.doc_string
+                else "",
+            )
         ]
+        for c in self.inner_classes:
+            result.extend(map(self.indent, c.to_lines()))
+
         for f in self.methods:
             if f.name not in self.methods_blacklist:
                 result.extend(map(self.indent, f.to_lines()))
@@ -488,10 +621,20 @@ class ClassStubsGenerator(StubsGenerator):
 
 
 class ModuleStubsGenerator(StubsGenerator):
-    ATTRIBUTES_BLACKLIST = ("__file__", "__loader__", "__name__", "__package__",
-                            "__spec__", "__path__", "__cached__", "__builtins__")
+    ATTRIBUTES_BLACKLIST = (
+        "__file__",
+        "__loader__",
+        "__name__",
+        "__package__",
+        "__spec__",
+        "__path__",
+        "__cached__",
+        "__builtins__",
+    )
 
-    def __init__(self, module_or_module_name, attributes_blacklist=ATTRIBUTES_BLACKLIST):
+    def __init__(
+        self, module_or_module_name, attributes_blacklist=ATTRIBUTES_BLACKLIST
+    ):
         if isinstance(module_or_module_name, str):
             self.module = importlib.import_module(module_or_module_name)
         else:
@@ -518,9 +661,14 @@ class ModuleStubsGenerator(StubsGenerator):
                     self.submodules.append(m)
                 else:
                     self.imported_modules = m.module.__name__
-                    logger.debug("Skip '%s' module while parsing '%s' " % (m.module.__name__, self.module.__name__))
+                    logger.debug(
+                        "Skip '%s' module while parsing '%s' "
+                        % (m.module.__name__, self.module.__name__)
+                    )
             elif inspect.isbuiltin(member) or inspect.isfunction(member):
-                self.free_functions.append(FreeFunctionStubsGenerator(name, member, self.module.__name__))
+                self.free_functions.append(
+                    FreeFunctionStubsGenerator(name, member, self.module.__name__)
+                )
             elif inspect.isclass(member) or inspect.isclass(member):
                 self.classes.append(ClassStubsGenerator(member))
             elif name == "__doc__":
@@ -528,29 +676,14 @@ class ModuleStubsGenerator(StubsGenerator):
             elif name not in self.attributes_blacklist:
                 self.attributes.append(AttributeStubsGenerator(name, member))
 
-        for x in itertools.chain(self.submodules,
-                                 self.classes,
-                                 self.free_functions,
-                                 self.attributes):
+        for x in itertools.chain(
+            self.submodules, self.classes, self.free_functions, self.attributes
+        ):
             x.parse()
-
-        def class_ordering(a, b):  # type: (ClassStubsGenerator, ClassStubsGenerator) -> int
-            if a.klass is b.klass:
-                return 0
-            if issubclass(a.klass, b.klass):
-                return -1
-            if issubclass(b.klass, a.klass):
-                return 1
-            return 0
 
         # reorder classes so base classes would be printed before derived
         # print([ k.klass.__name__ for k in self.classes ])
-        for i in range(len(self.classes)):
-            for j in range(i + 1, len(self.classes)):
-                if class_ordering(self.classes[i], self.classes[j]) < 0:
-                    t = self.classes[i]
-                    self.classes[i] = self.classes[j]
-                    self.classes[j] = t
+        self.classes.sort(reverse=True)
         # print( [ k.klass.__name__ for k in self.classes ] )
 
     def get_involved_modules_names(self):
@@ -559,45 +692,42 @@ class ModuleStubsGenerator(StubsGenerator):
         for attr in self.attributes:
             result |= attr.get_involved_modules_names()
 
-        for C in self.classes:  # type: ClassStubsGenerator
-            result |= C.get_involved_modules_names()
+        for c in self.classes:  # type: ClassStubsGenerator
+            result |= c.get_involved_modules_names()
 
         for f in self.free_functions:  # type: FreeFunctionStubsGenerator
             result |= f.get_involved_modules_names()
 
-        return set(result) - {"builtins", self.module.__name__}
+        return (
+            result
+            - {"builtins", self.module.__name__}
+            - {class_stub.klass.__name__ for class_stub in self.classes}
+        )
 
     def to_lines(self):  # type: () -> List[str]
 
         result = []
 
         if self.doc_string:
-            result += ['"""' + self.doc_string.replace('"""', r'\"\"\"') + '"""']
+            result += [
+                '"""'
+                + self.doc_string.replace('"', r"\"").replace('"""', r"\"\"\"")
+                + '"""'
+            ]
 
-        result += [
-            "import {}".format(self.module.__name__)
-        ]
+        result += ["import {}".format(self.module.__name__)]
 
         # import everything from typing
-        result += [
-            "from typing import *"
-        ]
+        result += ["from typing import *"]
         # pybind11 has some lower-cased prototypes from typing
         result += [
             "from typing import Iterable as iterable",
             "from typing import Iterator as iterator",
         ]
 
-        result += [
-            "from numpy import float64",
-            "_Shape = Tuple[int, ...]"
-        ]
-
         # import used packages
         used_modules = self.get_involved_modules_names()
         if used_modules:
-            # result.append("if TYPE_CHECKING:")
-            # result.extend(map(self.indent, map(lambda m: "import {}".format(m), used_modules)))
             result.extend(map(lambda mod: "import {}".format(mod), used_modules))
 
         # define __all__
@@ -622,11 +752,11 @@ class ModuleStubsGenerator(StubsGenerator):
                 all_is_defined = True
 
         if not all_is_defined:
-            result.append("__all__  = [\n" + ",\n".join(map(lambda s: '"%s"' % s, _all_)) + "\n]")
+            result.append(
+                "__all__  = [\n" + ",\n".join(map(lambda s: '"%s"' % s, _all_)) + "\n]"
+            )
 
-        for x in itertools.chain(self.classes,
-                                 self.free_functions,
-                                 self.attributes):
+        for x in itertools.chain(self.classes, self.free_functions, self.attributes):
             result.extend(x.to_lines())
         return result
 
@@ -635,87 +765,37 @@ class ModuleStubsGenerator(StubsGenerator):
         return self.module.__name__.split(".")[-1]
 
     def write(self):
-        if not os.path.exists(self.short_name + self.stub_suffix):
-            logger.info("mkdir `%s`" % (self.short_name + self.stub_suffix))
-            os.mkdir(self.short_name + self.stub_suffix)
-
-        with DirectoryWalkerGuard(self.short_name + self.stub_suffix):
-            with open("__init__.pyi", "w") as init_pyi:
-                init_pyi.write("\n".join(self.to_lines()))
-            for m in self.submodules:
-                m.write()
-
-            if self.write_setup_py:
-                with open("setup.py", "w") as setuppy:
-                    setuppy.write("""from setuptools import setup
-import os
-
-
-def find_stubs(package):
-    stubs = []
-    for root, dirs, files in os.walk(package):
-        for file in files:
-            path = os.path.join(root, file).replace(package + os.sep, '', 1)
-            stubs.append(path)
-    return dict(package=stubs)
-
-
-setup(
-    name='{package_name}-stubs',
-    maintainer="{package_name} Developers",
-    maintainer_email="example@python.org",
-    description="PEP 561 type stubs for {package_name}",
-    version='1.0',
-    packages=['{package_name}-stubs'],
-    # PEP 561 requires these
-    install_requires=['{package_name}'],
-    package_data=find_stubs('{package_name}-stubs'),
-)""".format(package_name=self.short_name))
-
-
-def recursive_mkdir_walker(subdirs, callback):  # type: (List[str], Callable) -> None
-    if len(subdirs) == 0:
-        callback()
-    else:
-        if not os.path.exists(subdirs[0]):
-            os.mkdir(subdirs[0])
-        with DirectoryWalkerGuard(subdirs[0]):
-            recursive_mkdir_walker(subdirs[1:], callback)
+        lines = self.to_lines()
+        logger.info("Writing %d lines to output", len(lines))
+        with open(f"{self.short_name}.pyi", "w") as pyi:
+            pyi.write("\n".join(lines))
 
 
 def main():
-    parser = ArgumentParser(prog='pybind11-stubgen', description="Generates stubs for specified modules")
-    parser.add_argument("-o", "--output-dir", help="the root directory for output stubs", default="./stubs")
-    parser.add_argument("--root_module_suffix", type=str, default="-stubs",
-                        help="optional suffix to disambiguate from the "
-                             "original package")
-    parser.add_argument("--no-setup-py", action='store_true')
-    parser.add_argument("module_names", nargs="+", metavar="MODULE_NAME", type=str, help="modules names")
-    parser.add_argument("--log-level", default="WARNING", help="Set output log level")
-
-    sys_args = parser.parse_args()
-
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    handlers = [stderr_handler]
-
-    logging.basicConfig(
-        level=logging.getLevelName(sys_args.log_level),
-        format='[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s',
-        handlers=handlers
+    parser = ArgumentParser(
+        prog="pybind11-stubgen", description="Generates stubs for specified modules"
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        help="the root directory for output stubs",
+        default="./stubs",
+    )
+    parser.add_argument(
+        "module_name", metavar="MODULE_NAME", type=str, help="module name"
     )
 
-    output_path = sys_args.output_dir
+    args = parser.parse_args()
 
-    if not os.path.exists(output_path):
-        os.mkdir(output_path)
+    if not os.path.exists(args.output_dir):
+        raise ValueError(f"Output path {args.output_dir} does not exist")
 
-    with DirectoryWalkerGuard(output_path):
-        for _module_name in sys_args.module_names:
-            _module = ModuleStubsGenerator(_module_name)
-            _module.parse()
-            _module.stub_suffix = sys_args.root_module_suffix
-            _module.write_setup_py = not sys_args.no_setup_py
-            recursive_mkdir_walker(_module_name.split(".")[:-1], lambda: _module.write())
+    logger.info("Will generate type stubs for %s in %s", args.module_name, output_path)
+
+    with ChdirGuard(args.output_dir):
+        module = ModuleStubsGenerator(args.module_name)
+        module.parse()
+        module.write()
 
 
 if __name__ == "__main__":
